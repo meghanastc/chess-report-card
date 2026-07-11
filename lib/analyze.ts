@@ -1,10 +1,19 @@
 import { Chess } from "chess.js";
-import { ChessEngine } from "./engine";
-import { resolveOpeningName } from "./openings";
+import { ChessEngine, EvalResult } from "./engine";
+import { lookupOpening, resolveOpeningName } from "./openings";
+import {
+  CategoryContext,
+  classifyMistakeCategory,
+  countMaterial,
+  extractClockSeconds,
+  parseStartClockSeconds,
+  pieceValue,
+} from "./mistakeCategories";
 import {
   AnalysisProgress,
   FlaggedMove,
   GameSummary,
+  PatternSummary,
   Phase,
   RawGame,
   Report,
@@ -13,6 +22,8 @@ import {
 
 const MAX_PLIES_ANALYZED = 60; // ~30 full moves/game keeps runtime reasonable client-side
 const ENGINE_DEPTH = 10;
+const TOP_MISTAKES_PER_GAME = 3; // Developer Spec 1.2 step 3
+const TOP_PATTERNS_COUNT = 3; // Developer Spec 1.2 step 4
 
 // Standard win% conversion (the same logistic curve Lichess uses) so the
 // "accuracy" number below means the same thing chess players already expect.
@@ -40,6 +51,16 @@ function phaseForPly(ply: number, totalPlies: number): Phase {
   return "middlegame";
 }
 
+interface CandidateMove extends FlaggedMove {}
+
+/**
+ * Free Tier pipeline (Developer Spec 1.1-1.2): for each of the player's own
+ * moves, tracks the engine eval and board FEN before/after so we can both
+ * measure how bad a move was (severity, via win% swing) and classify what
+ * *kind* of mistake it was (category, via lib/mistakeCategories.ts). Keeps
+ * only the worst 3 flagged moves per game, then aggregates the categories
+ * across all games into the top 3 recurring patterns.
+ */
 export async function analyzeGames(
   username: string,
   platform: "lichess" | "chesscom",
@@ -51,11 +72,7 @@ export async function analyzeGames(
   await engine.init();
 
   const gameSummaries: GameSummary[] = [];
-  const allFlags: FlaggedMove[] = [];
-  const openingStats = new Map<
-    string,
-    { timesPlayed: number; losses: number; blundersIn: number }
-  >();
+  const allTopMistakes: CandidateMove[] = [];
   const phaseTotals: Record<Phase, number> = {
     opening: 0,
     middlegame: 0,
@@ -78,21 +95,26 @@ export async function analyzeGames(
 
     const history = chess.history({ verbose: true });
     const totalPlies = Math.min(history.length, MAX_PLIES_ANALYZED);
-    const { name: openingName, eco } = resolveOpeningName(
-      headers,
-      history.map((h) => h.san)
-    );
+    const sanMoves = history.map((h) => h.san);
+    const { name: openingName, eco } = resolveOpeningName(headers, sanMoves);
+    const openingMatch = lookupOpening(sanMoves);
 
-    // Replay the game move by move, evaluating every position once.
+    const clocks = extractClockSeconds(raw.pgn);
+    const startClockSeconds = parseStartClockSeconds(headers["TimeControl"]);
+
+    // Replay the game move by move, evaluating every position once and
+    // recording both the eval and the resulting FEN (fenByPly[k] = position
+    // after k plies played; fenByPly[0] = starting position).
     const replay = new Chess();
-    const cpByPly: number[] = [];
-    cpByPly.push(0); // starting position, roughly balanced
+    const evalByPly: EvalResult[] = [{ cp: 0 }];
+    const fenByPly: string[] = [replay.fen()];
 
     for (let ply = 0; ply < totalPlies; ply++) {
       const move = history[ply];
       replay.move({ from: move.from, to: move.to, promotion: move.promotion });
       const evalRes = await engine.evaluateFen(replay.fen(), ENGINE_DEPTH);
-      cpByPly.push(evalRes.cp);
+      evalByPly.push(evalRes);
+      fenByPly.push(replay.fen());
       onProgress({
         stage: "analyzing",
         message: `Analyzing ${username}'s games…`,
@@ -107,63 +129,79 @@ export async function analyzeGames(
       mistakes = 0,
       inaccuracies = 0;
     const moveAccuracies: number[] = [];
-    let worstMoment: FlaggedMove | undefined;
-    let worstLoss = -Infinity;
+    const candidates: CandidateMove[] = [];
 
     for (let ply = 0; ply < totalPlies; ply++) {
       const mover = ply % 2 === 0 ? "w" : "b";
       if (mover !== playerColor) continue;
       const sign = playerColor === "w" ? 1 : -1;
-      // Normalize both evals to the player's own perspective before diffing.
-      const before = cpByPly[ply] * sign;
-      const after = cpByPly[ply + 1] * sign;
-      const wpBeforePlayer = winPercent(before);
-      const wpAfterPlayer = winPercent(after);
-      const wpLoss = Math.max(0, wpBeforePlayer - wpAfterPlayer);
-      const acc = moveAccuracy(wpLoss);
-      moveAccuracies.push(acc);
+
+      const before = evalByPly[ply].cp * sign;
+      const after = evalByPly[ply + 1].cp * sign;
+      const wpLoss = Math.max(0, winPercent(before) - winPercent(after));
+      moveAccuracies.push(moveAccuracy(wpLoss));
 
       const severity = classifySeverity(wpLoss);
-      if (severity) {
-        const phase = phaseForPly(ply, totalPlies);
-        phaseTotals[phase]++;
-        const flag: FlaggedMove = {
-          gameIndex: gi,
-          ply,
-          moveNumber: Math.floor(ply / 2) + 1,
-          san: history[ply].san,
-          severity,
-          cpBefore: before,
-          cpAfter: after,
-          winPercentLoss: wpLoss,
-          phase,
-        };
-        allFlags.push(flag);
-        if (severity === "blunder") blunders++;
-        else if (severity === "mistake") mistakes++;
-        else inaccuracies++;
-        if (wpLoss > worstLoss) {
-          worstLoss = wpLoss;
-          worstMoment = flag;
-        }
-      }
+      if (!severity) continue;
+
+      const phase = phaseForPly(ply, totalPlies);
+      phaseTotals[phase]++;
+      if (severity === "blunder") blunders++;
+      else if (severity === "mistake") mistakes++;
+      else inaccuracies++;
+
+      const evalBeforeSelf: EvalResult = {
+        cp: before,
+        mate: evalByPly[ply].mate !== undefined ? evalByPly[ply].mate! * sign : undefined,
+      };
+      const evalAfterSelf: EvalResult = {
+        cp: after,
+        mate:
+          evalByPly[ply + 1].mate !== undefined ? evalByPly[ply + 1].mate! * sign : undefined,
+      };
+      const materialBeforeSelf = countMaterial(fenByPly[ply], playerColor);
+      const materialTwoPlyLaterSelf = countMaterial(
+        fenByPly[Math.min(ply + 2, fenByPly.length - 1)],
+        playerColor
+      );
+      const ownMoveCaptureValue = pieceValue(history[ply].captured);
+
+      const ctx: CategoryContext = {
+        phase,
+        evalBeforeSelf,
+        evalAfterSelf,
+        materialBeforeSelf,
+        materialTwoPlyLaterSelf,
+        ownMoveCaptureValue,
+        clockSecondsRemaining: clocks[ply],
+        startClockSeconds,
+      };
+      const category = classifyMistakeCategory(ctx);
+
+      candidates.push({
+        gameIndex: gi,
+        ply,
+        moveNumber: Math.floor(ply / 2) + 1,
+        san: history[ply].san,
+        severity,
+        cpBefore: before,
+        cpAfter: after,
+        winPercentLoss: wpLoss,
+        phase,
+        category,
+      });
     }
+
+    const topMistakes = candidates
+      .slice()
+      .sort((a, b) => b.winPercentLoss - a.winPercentLoss)
+      .slice(0, TOP_MISTAKES_PER_GAME);
+    allTopMistakes.push(...topMistakes);
 
     const resultTag = headers["Result"];
     let result: "win" | "loss" | "draw" = "draw";
     if (resultTag === "1-0") result = playerColor === "w" ? "win" : "loss";
     else if (resultTag === "0-1") result = playerColor === "b" ? "win" : "loss";
-
-    const key = openingName;
-    const stat = openingStats.get(key) || {
-      timesPlayed: 0,
-      losses: 0,
-      blundersIn: 0,
-    };
-    stat.timesPlayed++;
-    if (result === "loss") stat.losses++;
-    stat.blundersIn += blunders;
-    openingStats.set(key, stat);
 
     gameSummaries.push({
       index: gi,
@@ -173,6 +211,7 @@ export async function analyzeGames(
       result,
       opening: openingName,
       eco,
+      openingMatchedPly: openingMatch?.matchedPly,
       date: headers["Date"] || headers["UTCDate"],
       timeControl: headers["TimeControl"],
       accuracy: moveAccuracies.length
@@ -183,13 +222,12 @@ export async function analyzeGames(
       blunders,
       mistakes,
       inaccuracies,
-      worstMoment,
+      topMistakes,
       plyCount: totalPlies,
     });
   }
 
   engine.terminate();
-
   onProgress({ stage: "reporting", message: "Building your report…" });
 
   const wins = gameSummaries.filter((g) => g.result === "win").length;
@@ -205,18 +243,7 @@ export async function analyzeGames(
         ) / 10
       : 0;
 
-  const recurringOpenings = Array.from(openingStats.entries())
-    .map(([opening, s]) => ({ opening, ...s }))
-    .filter((o) => o.timesPlayed >= 2)
-    .sort((a, b) => b.blundersIn - a.blundersIn || b.losses - a.losses);
-
-  const practicePlan = buildPracticePlan({
-    recurringOpenings,
-    phaseTotals,
-    totalBlunders,
-    totalMistakes,
-    gameSummaries,
-  });
+  const topPatterns = buildTopPatterns(allTopMistakes);
 
   return {
     username,
@@ -226,56 +253,32 @@ export async function analyzeGames(
     averageAccuracy: avgAccuracy,
     totals: { blunders: totalBlunders, mistakes: totalMistakes, inaccuracies: totalInaccuracies },
     games: gameSummaries,
-    recurringOpenings,
+    topPatterns,
     phaseBreakdown: phaseTotals,
-    practicePlan,
     generatedAt: new Date().toISOString(),
   };
 }
 
-function buildPracticePlan(ctx: {
-  recurringOpenings: { opening: string; timesPlayed: number; losses: number; blundersIn: number }[];
-  phaseTotals: Record<Phase, number>;
-  totalBlunders: number;
-  totalMistakes: number;
-  gameSummaries: GameSummary[];
-}): string[] {
-  const plan: string[] = [];
-
-  const worstOpening = ctx.recurringOpenings[0];
-  if (worstOpening && (worstOpening.blundersIn > 0 || worstOpening.losses > 0)) {
-    plan.push(
-      `Review "${worstOpening.opening}" — you've played it ${worstOpening.timesPlayed} times with ${worstOpening.losses} loss(es) and ${worstOpening.blundersIn} blunder(s). Study the main line to move 10-12 before your next game.`
-    );
+/**
+ * Aggregates the top flagged moves across every game (Developer Spec 1.2
+ * step 4) by their rule-based category, and returns the 3 most frequent
+ * ones with a couple of concrete examples each.
+ */
+function buildTopPatterns(allTopMistakes: CandidateMove[]): PatternSummary[] {
+  const byCategory = new Map<string, CandidateMove[]>();
+  for (const m of allTopMistakes) {
+    const list = byCategory.get(m.category) || [];
+    list.push(m);
+    byCategory.set(m.category, list);
   }
 
-  const phaseEntries = Object.entries(ctx.phaseTotals) as [Phase, number][];
-  const worstPhase = phaseEntries.sort((a, b) => b[1] - a[1])[0];
-  if (worstPhase && worstPhase[1] > 0) {
-    const tips: Record<Phase, string> = {
-      opening:
-        "Most mistakes happen in the opening — slow down in the first 10 moves and stick to lines you've actually studied rather than improvising.",
-      middlegame:
-        "Most mistakes happen in the middlegame — add 10-15 minutes/day of tactics puzzles (forks, pins, discovered attacks) to sharpen pattern recognition.",
-      endgame:
-        "Most mistakes happen in the endgame — review basic theoretical endgames (king+pawn, rook endings) since these are where converted advantages are lost.",
-    };
-    plan.push(`${tips[worstPhase[0]]} (${worstPhase[1]} flagged moves in this phase.)`);
-  }
+  const summaries = Array.from(byCategory.entries())
+    .map(([category, moves]) => ({
+      category,
+      count: moves.length,
+      examples: moves.slice(0, 3).map((m) => `Game ${m.gameIndex + 1}, move ${m.moveNumber}: ${m.san}`),
+    }))
+    .sort((a, b) => b.count - a.count);
 
-  if (ctx.totalBlunders > 0) {
-    plan.push(
-      `You had ${ctx.totalBlunders} outright blunder(s) across these games — before moving, ask "what does this move allow?" for your opponent's best reply, especially in sharp or unfamiliar positions.`
-    );
-  } else if (ctx.totalMistakes > 0) {
-    plan.push(
-      `No outright blunders, but ${ctx.totalMistakes} mistake(s) crept in — double-check candidate moves against forcing replies (checks, captures, threats) before playing.`
-    );
-  } else {
-    plan.push(
-      "Very clean games in this sample — keep reinforcing strengths and consider studying slightly sharper openings to create more winning chances."
-    );
-  }
-
-  return plan.slice(0, 3);
+  return summaries.slice(0, TOP_PATTERNS_COUNT);
 }
